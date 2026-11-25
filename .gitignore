@@ -1,0 +1,11 @@
+.env
+research-private/
+.DS_Store
+node_modules/
+docs/design/refs-img/
+.build/
+build/
+*.xcodeproj
+.swiftpm/
+.playwright-mcp/
+tools/e2e/.dictate-run

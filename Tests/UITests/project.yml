@@ -1,0 +1,23 @@
+# XcodeGen spec for XCUITest walks of the real build/Susu.app (BUILD-PLAN, «Тестирование»).
+# Generate: xcodegen --spec Tests/UITests/project.yml (the .xcodeproj is gitignored).
+# Run: make app && xcodebuild test -project Tests/UITests/SusuUITests.xcodeproj -scheme SusuUITests
+name: SusuUITests
+options:
+  deploymentTarget:
+    macOS: "14.4"
+targets:
+  SusuUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources: [SusuUITests]
+    settings:
+      GENERATE_INFOPLIST_FILE: YES
+      CODE_SIGN_IDENTITY: "-"
+      PRODUCT_BUNDLE_IDENTIFIER: app.susu.SusuUITests
+schemes:
+  SusuUITests:
+    build:
+      targets:
+        SusuUITests: [test]
+    test:
+      targets: [SusuUITests]

@@ -1,0 +1,19 @@
+#!/bin/bash
+# XCUITest walk of build/Susu.app; exports the screenshots to build/walk/. Run when nobody uses the Mac.
+set -uo pipefail
+cd "$(dirname "$0")/../.."
+make app >/dev/null || exit 1
+xcodegen --spec Tests/UITests/project.yml --quiet
+rm -rf build/walk build/walk.xcresult
+xcodebuild test -quiet -project Tests/UITests/SusuUITests.xcodeproj -scheme SusuUITests -destination 'platform=macOS,arch=arm64' \
+  -only-testing:SusuUITests/WalkTests -resultBundlePath build/walk.xcresult; code=$?
+xcrun xcresulttool export attachments --path build/walk.xcresult --output-path build/walk >/dev/null
+python3 -I -c '
+import json, os, sys
+d = sys.argv[1]
+for t in json.load(open(os.path.join(d, "manifest.json"))):
+    for a in t.get("attachments", []):
+        os.rename(os.path.join(d, a["exportedFileName"]), os.path.join(d, a["suggestedHumanReadableName"].split("_")[0] + ".png"))
+' build/walk 2>/dev/null
+ls build/walk | grep png | wc -l
+exit $code

@@ -1,0 +1,25 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Swift version
+        run: swift --version
+      - name: onnxruntime binaries into the SwiftPM cache
+        run: tools/ort-cache
+      - name: Build
+        run: swift build
+      - name: Test
+        run: make test
+      - name: SusuCore for iOS Simulator
+        run: make ios
+      - name: App bundle (ad-hoc signed)
+        run: make app

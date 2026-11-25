@@ -1,0 +1,22 @@
+#!/bin/bash
+# Unattended night run (M1–M4 checks): UI walk, voice E2E from files with and without the dictionary, then through the mic.
+# Every step logs to build/night/; the app's per-stage timing goes to build/night/timing-<step>.log.
+cd "$(dirname "$0")/../.."
+mkdir -p build/night
+caffeinate -d -i -w $$ &   # keep the display awake: a locked screen fails UI tests ("enabling automation mode")
+cp tools/e2e/dictate tools/e2e/.dictate-run   # a frozen copy: editing the script mid-run must not break it
+step() {  # name, command...
+  local name=$1; shift
+  local t0; t0=$(date '+%Y-%m-%d %H:%M:%S')
+  echo "== $name $(date +%H:%M)"
+  "$@" > "build/night/$name.out" 2>&1; echo "exit $?" >> "build/night/$name.out"
+  /usr/bin/log show --start "$t0" --info --predicate 'subsystem == "app.susu" AND category == "timing"' 2>/dev/null \
+    | grep -o 'timing .*' > "build/night/timing-$name.log"
+  tail -12 "build/night/$name.out"
+}
+make app > build/night/make.out 2>&1 || { echo "make app failed"; exit 1; }
+step walk tools/ui/walk
+step file-dict env E2E_SOURCE=file bash tools/e2e/.dictate-run
+step file-nodict env E2E_SOURCE=file E2E_DICT=0 bash tools/e2e/.dictate-run 25
+step mic-dict bash tools/e2e/.dictate-run
+echo "== done $(date +%H:%M)"

@@ -1,0 +1,54 @@
+#!/bin/bash
+# E2E stand self-check (BUILD-PLAN T0.5). Prints one line per check, exits 1 if any fails.
+# 1) a clip played into BlackHole is heard back on the BlackHole input;
+# 2) the text of a TextEdit field is read through Accessibility;
+# 3) the three test sandboxes exist (Calendar "Susu Test", Bitrix group "Susu Test", TickTick list "Susu Test").
+# Takes the virtual mic for ~6 s and opens a TextEdit window; presses no keys.
+set -uo pipefail
+cd "$(dirname "$0")/../.."
+. tools/e2e/lib.sh
+[ -f .env ] && { set -a; . ./.env; set +a; }
+[ -f "$HOME/Projects/susu/.env" ] && { set -a; . "$HOME/Projects/susu/.env"; set +a; }
+FAIL=0
+res() { printf '%-34s %s\n' "$1" "$2"; case $2 in ok*) ;; *) FAIL=1 ;; esac; }
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+
+# 1. Virtual microphone loop
+if ! e2e_has_device; then
+  res "BlackHole loop" "FAIL: '$E2E_DEVICE' not installed (brew install blackhole-2ch)"
+else
+  CLIP="$SUSU_TESTSET/clips/c01.wav"
+  e2e_record 5 "$TMP/heard.wav" & REC=$!
+  sleep 0.5; e2e_play "$CLIP"; wait $REC
+  PEAK=$(e2e_peak "$TMP/heard.wav"); SRC=$(e2e_peak "$CLIP")
+  if awk -v p="${PEAK:-0}" 'BEGIN{exit !(p > 0.05)}'; then res "BlackHole loop" "ok (peak heard $PEAK, clip $SRC)"
+  else res "BlackHole loop" "FAIL: heard peak ${PEAK:-none} (needs Microphone permission for this terminal app)"; fi
+fi
+
+# 2. Accessibility read of a TextEdit field
+e2e_build_helper || { res "build helper" "FAIL"; exit 1; }
+"$HELPER" trusted >/dev/null  # shows the Accessibility prompt once if not granted yet
+WANT="Susu e2e selftest $(date +%s)"
+printf '%s' "$WANT" > "$TMP/selftest.txt"
+open -a TextEdit "$TMP/selftest.txt"; sleep 2
+GOT=$(e2e_field_text com.apple.TextEdit 2>&1)
+osascript -e 'tell application "TextEdit" to close (every document whose name is "selftest.txt") saving no' >/dev/null 2>&1
+if [ "$GOT" = "$WANT" ]; then res "TextEdit field via Accessibility" "ok ($GOT)"
+else res "TextEdit field via Accessibility" "FAIL: got '$GOT' (needs Accessibility permission for this terminal app)"; fi
+
+# 3. Sandboxes
+CALS=$(osascript -e 'tell application "Calendar" to get name of calendars' 2>&1)
+case ", $CALS," in *", Susu Test,"*) res "Calendar 'Susu Test'" "ok" ;;
+  *) res "Calendar 'Susu Test'" "FAIL: not found (tools/e2e/sandboxes --create) ${CALS:0:80}" ;; esac
+
+if [ -z "${SUSU_BITRIX_WEBHOOK:-}" ]; then res "Bitrix group 'Susu Test'" "FAIL: SUSU_BITRIX_WEBHOOK not set in .env"
+elif curl -s "${SUSU_BITRIX_WEBHOOK%/}/sonet_group.get.json?FILTER%5BNAME%5D=Susu%20Test" | grep -q '"NAME":"Susu Test"'; then
+  res "Bitrix group 'Susu Test'" "ok"
+else res "Bitrix group 'Susu Test'" "FAIL: group not found"; fi
+
+if [ -z "${SUSU_TICKTICK_TOKEN:-}" ]; then res "TickTick list 'Susu Test'" "FAIL: SUSU_TICKTICK_TOKEN not set in .env"
+elif curl -s -H "Authorization: Bearer $SUSU_TICKTICK_TOKEN" https://api.ticktick.com/open/v1/project | grep -q '"name":"Susu Test"'; then
+  res "TickTick list 'Susu Test'" "ok"
+else res "TickTick list 'Susu Test'" "FAIL: list not found"; fi
+
+exit $FAIL

@@ -1,0 +1,134 @@
+#!/bin/bash
+# Evidence producers for the release gate (scripts/verify.sh --release, SUSU.md section 10).
+# Each step writes build/verify/<step>.json naming the commit and the app's code directory hash,
+# so a result can never be counted for another build.
+#   tools/e2e/evidence [all | e2e | performance | first-run]      (default: all)
+# Presses keys, takes the virtual microphone and opens windows: run only when nobody uses the Mac.
+# Starts and stops only build/Susu.app of this checkout, with its own data folders under build/.
+# Result files hold counts and timings only, never dictated text.
+set -uo pipefail
+cd "$(dirname "$0")/../.."
+. tools/e2e/lib.sh
+WHAT=${1:-all}
+mkdir -p build/verify build/evidence
+
+[ -z "$(git status --porcelain)" ] || { echo "uncommitted changes: evidence must name a commit"; exit 1; }
+COMMIT=$(git rev-parse HEAD)
+scripts/build-app.sh > build/evidence/build-app.log 2>&1 || { echo "app build failed, see build/evidence/build-app.log"; exit 1; }
+APP_ID=$(scripts/app-id.sh) || { echo "build/Susu.app is missing or its signature is invalid"; exit 1; }
+e2e_build_helper || { echo "helper build failed"; exit 1; }
+# Asked without a system prompt: a dialog nobody is there to answer would only block the screen.
+"$HELPER" is-trusted >/dev/null || { echo "no Accessibility permission for the app running this script (System Settings, Privacy & Security, Accessibility)"; exit 3; }
+echo "commit $COMMIT  app $APP_ID"
+caffeinate -d -i -w $$ &
+
+# write <step> <verdict> <json object with the details>
+write() {
+  python3 -I - "$1" "$2" "$3" "$COMMIT" "$APP_ID" <<'PY'
+import datetime, json, platform, subprocess, sys
+step, verdict, details, commit, app = sys.argv[1:6]
+out = {"step": step, "commit": commit, "app_cdhash": app, "verdict": verdict,
+       "finished_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+       "machine": subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True).stdout.strip(),
+       "macos": platform.mac_ver()[0]}
+out.update(json.loads(details))
+out.pop("verdict_", None)
+json.dump(out, open("build/verify/%s.json" % step, "w"), ensure_ascii=False, indent=1)
+print("%-12s %s" % (step, verdict))
+PY
+}
+
+step_e2e() {
+  local t0 code run
+  t0=$(date '+%Y-%m-%d %H:%M:%S')
+  bash tools/e2e/dictate ${E2E_CLIPS:-} > build/evidence/e2e.out 2>&1; code=$?
+  run=$(sed -n 's/^run: //p' build/evidence/e2e.out | tail -1)
+  # Per-stage timing the app logged during this run; only the app of this checkout.
+  /usr/bin/log show --start "$t0" --info \
+    --predicate "subsystem == \"app.susu\" AND category == \"timing\" AND processImagePath BEGINSWITH \"$E2E_ROOT/build/\"" 2>/dev/null \
+    | grep -o 'timing audio=.*' > build/evidence/timing.log
+  local details
+  details=$(python3 -I - "$run" "$code" <<'PY'
+import json, sys
+run, code = sys.argv[1], int(sys.argv[2])
+try: rows = json.load(open(run))
+except Exception: rows = {}
+statuses = {}
+for r in rows.values(): statuses[r.get("status") or "none"] = statuses.get(r.get("status") or "none", 0) + 1
+inserted = sum(1 for r in rows.values() if (r.get("text") or "").strip())
+print(json.dumps({"source": "virtual microphone (BlackHole), real app, text read back from TextEdit",
+                  "clips": len(rows), "text_in_field": inserted, "statuses": statuses,
+                  "quality_check_exit": code,
+                  "quality_gates": "names >= 0.80, WER ru <= 0.13 (tools/stt-eval/check.py)"}))
+PY
+  )
+  if [ "$code" -eq 0 ] && [ -n "$run" ]; then write e2e PASS "$details"; else write e2e FAIL "$details"; fi
+}
+
+# Uses the timing lines of the e2e step. Gates are the P95 limits of SUSU.md section 4; a gate that
+# is not measured yet keeps the verdict at FAIL: nothing is assumed to pass.
+step_performance() {
+  local details verdict
+  details=$(python3 -I - build/evidence/timing.log <<'PY'
+import json, re, sys
+stages = {}
+try: lines = open(sys.argv[1]).read().splitlines()
+except FileNotFoundError: lines = []
+for line in lines:
+    for name, value in re.findall(r"(\S+?)=(\d+)(?:ms)?(?=\s|$)", line):
+        stages.setdefault(name, []).append(int(value))
+def pct(v, p):
+    v = sorted(v); return v[min(len(v) - 1, int(round(p * (len(v) - 1))))]
+summary = {k: {"n": len(v), "p50": pct(v, .5), "p95": pct(v, .95), "max": max(v)} for k, v in stages.items()}
+gates, reasons = [], []
+ins = summary.get("insert")
+if not ins: reasons.append("insert: no measurements")
+else:
+    ok = ins["p95"] <= 100 and ins["n"] >= 100
+    gates.append({"gate": "ready text -> inserted into the field", "limit_ms": 100, "p95_ms": ins["p95"], "n": ins["n"], "pass": ok})
+    if ins["p95"] > 100: reasons.append("insert p95 %d ms > 100 ms" % ins["p95"])
+    if ins["n"] < 100: reasons.append("insert: %d measurements, the mandate asks for at least 100" % ins["n"])
+not_measured = ["hotkey -> first visible confirmation (50 ms)", "record command -> visible indicator (75 ms)",
+                "record command -> first audio samples, warm (150 ms)", "warm window open -> interactive (250 ms)",
+                "cold launch -> menu bar and hotkey ready (1000 ms)", "stop -> final local raw text of a short dictation (800 ms)",
+                "local search over 10 000 objects (150 ms)", "UI frame time (16.7 ms)", "idle CPU, memory footprint"]
+reasons += ["not measured: " + g for g in not_measured]
+print(json.dumps({"verdict_": "PASS" if not reasons else "FAIL", "stages_ms": summary, "gates": gates,
+                  "not_measured": not_measured, "reasons": reasons, "raw_ms": stages}))
+PY
+  )
+  verdict=$(python3 -I -c 'import json,sys; print(json.loads(sys.argv[1])["verdict_"])' "$details")
+  write performance "$verdict" "$details"
+}
+
+# First launch with an empty data folder: the app must stay up, create its database and show the wizard.
+# Same macOS user: permissions and Keychain items are the ones this user already has.
+step_first_run() {
+  local data="$E2E_ROOT/build/first-run-data" pid windows alive=false db=false done_flag details ok
+  rm -rf "$data"; mkdir -p "$data"
+  e2e_kill_app; sleep 0.5
+  open -n --env SUSU_DATA_DIR="$data" --env SUSU_TRIGGER="${E2E_TRIGGER:-leftOption}" build/Susu.app
+  for _ in $(seq 50); do [ -f "$data/susu.sqlite" ] && break; sleep 0.2; done
+  sleep 5
+  pid=$(e2e_app_pid || true)
+  [ -n "$pid" ] && alive=true
+  [ -f "$data/susu.sqlite" ] && db=true
+  windows=0; [ -n "$pid" ] && windows=$("$HELPER" window-count "$pid" 2>/dev/null || echo 0)
+  done_flag=$(python3 -I -c 'import json,sys
+try: print(str(bool(json.load(open(sys.argv[1])).get("onboardingDone"))).lower())
+except Exception: print("false")' "$data/settings.json")
+  e2e_kill_app
+  ok=FAIL
+  [ "$alive" = true ] && [ "$db" = true ] && [ "${windows:-0}" -ge 1 ] && [ "$done_flag" = false ] && ok=PASS
+  details=$(printf '{"scope":"empty data folder, same macOS user","process_alive_after_start":%s,"database_created":%s,"windows_shown":%s,"wizard_marked_done":%s,"not_covered":["a macOS account that never ran Susu (permission prompts, Keychain)","walking the wizard to the end"]}' \
+    "$alive" "$db" "${windows:-0}" "$done_flag")
+  write first-run "$ok" "$details"
+}
+
+case "$WHAT" in
+  e2e) step_e2e ;;
+  performance) step_performance ;;
+  first-run) step_first_run ;;
+  all) step_first_run; step_e2e; step_performance ;;
+  *) echo "usage: tools/e2e/evidence [all|e2e|performance|first-run]"; exit 2 ;;
+esac

@@ -1,0 +1,24 @@
+#!/bin/bash
+# Create the test sandboxes the agent may write to (BUILD-PLAN, «Тестирование»). Idempotent.
+# Calendar "Susu Test" (Calendar.app, first account) and TickTick list "Susu Test" (if SUSU_TICKTICK_TOKEN is set).
+# The Bitrix group "Susu Test" is created by hand.
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+[ -f "$HOME/Projects/susu/.env" ] && { set -a; . "$HOME/Projects/susu/.env"; set +a; }
+
+osascript <<'EOF'
+tell application "Calendar"
+  if not (exists calendar "Susu Test") then make new calendar with properties {name:"Susu Test"}
+end tell
+EOF
+echo "Calendar 'Susu Test' ready"
+
+if [ -n "${SUSU_TICKTICK_TOKEN:-}" ]; then
+  if ! curl -s -H "Authorization: Bearer $SUSU_TICKTICK_TOKEN" https://api.ticktick.com/open/v1/project | grep -q '"name":"Susu Test"'; then
+    curl -s -X POST -H "Authorization: Bearer $SUSU_TICKTICK_TOKEN" -H 'Content-Type: application/json' \
+      -d '{"name":"Susu Test"}' https://api.ticktick.com/open/v1/project >/dev/null
+  fi
+  echo "TickTick list 'Susu Test' ready"
+else
+  echo "TickTick skipped: SUSU_TICKTICK_TOKEN not set"
+fi

@@ -1,0 +1,69 @@
+#!/bin/bash
+# Dictation E2E (BUILD-PLAN «Тестирование»): the real Susu.app hears clips through BlackHole,
+# the test holds the trigger key, then reads the field via Accessibility and Susu's latency_ms.
+# usage: tools/e2e/dictate [N clips, default all] — writes $SUSU_TESTSET/runs/e2e-<time>.json and checks it.
+# Presses keys and takes the virtual mic: run only when nobody uses the Mac. Holds left Option by default
+# (E2E_TRIGGER): Ctrl stays free for Wispr, and the right-hand modifiers are the keys of the user's own Susu.
+# Data goes to build/e2e-data, never to the real Susu folder. TextEdit only: nothing is ever sent anywhere.
+set -uo pipefail
+cd "$(dirname "$0")/../.."
+. tools/e2e/lib.sh
+LIMIT=${1:-1000}
+TRIGGER=${E2E_TRIGGER:-leftOption}        # a lone modifier: macOS 27 drops synthetic F18 key-downs
+case $TRIGGER in leftOption) KEY=58 ;; rightOption) KEY=61 ;; leftCommand) KEY=55 ;; rightCommand) KEY=54 ;;
+  rightControl) KEY=62 ;; leftShift) KEY=56 ;; rightShift) KEY=60 ;; *) echo "unknown E2E_TRIGGER $TRIGGER"; exit 1 ;; esac
+e2e_trigger_free "$TRIGGER" || { echo "$TRIGGER is a hotkey of the Susu already running on this Mac: pick another E2E_TRIGGER"; exit 1; }
+DATA="$E2E_ROOT/build/e2e-data"
+SUSU_DB="$DATA/susu.sqlite"
+RUN="$SUSU_TESTSET/runs/e2e-$(date +%Y%m%d-%H%M).json"
+# E2E_SOURCE=file: the app reads each clip from a file instead of the mic (no Microphone permission needed;
+# covers everything after the mic). Default: BlackHole as the mic.
+SOURCE=${E2E_SOURCE:-mic}
+[ "$SOURCE" = file ] || e2e_has_device || { echo "no $E2E_DEVICE"; exit 1; }
+e2e_build_helper
+
+rm -rf "$DATA"; mkdir -p "$DATA"
+printf '{"micPriority":["BlackHole"],"onboardingDone":true}' > "$DATA/settings.json"
+e2e_kill_app; sleep 0.5
+EXTRA=(); [ "$SOURCE" = file ] && EXTRA=(--env SUSU_E2E_AUDIO="$DATA/next.wav")
+open -n --env SUSU_DATA_DIR="$DATA" --env SUSU_TRIGGER="$TRIGGER" ${EXTRA[@]+"${EXTRA[@]}"} build/Susu.app
+for _ in $(seq 50); do [ -f "$SUSU_DB" ] && break; sleep 0.2; done
+sleep 4   # hotkey tap and first STT connection
+# The same dictionary as the benchmark runs (hint.txt terms as words): a fresh Susu would have the user's Wispr dictionary.
+# E2E_DICT=0 skips it (to measure what the dictionary costs in latency).
+[ "${E2E_DICT:-1}" = 1 ] && python3 -I -c '
+import sqlite3, sys, uuid, datetime
+t = open(sys.argv[2]).read().strip(); t = t.split(":", 1)[1] if ":" in t else t
+now = datetime.datetime.utcnow().isoformat() + "Z"
+db = sqlite3.connect(sys.argv[1], timeout=5)
+db.executemany("INSERT INTO dictionary_entry (id, kind, phrase, origin, created_at) VALUES (?, ?, ?, ?, ?)",
+               [(str(uuid.uuid4()), "word", w.strip().rstrip("."), "manual", now) for w in t.split(",") if w.strip()])
+db.commit()' "$SUSU_DB" "$SUSU_TESTSET/hint.txt"
+
+lastid() { sqlite3 -readonly "$SUSU_DB" "SELECT ifnull(max(rowid),0) FROM dictation" 2>/dev/null || echo -1; }
+echo "{" > "$RUN.tmp"; FIRST=1; N=0
+for wav in "$SUSU_TESTSET"/clips/c*.wav; do
+  [ "$N" -ge "$LIMIT" ] && break; N=$((N+1))
+  id=$(basename "$wav" .wav)
+  # Only the window this script made is ever closed (by name): the user's own TextEdit documents stay untouched.
+  doc=$(osascript -e 'tell application "TextEdit" to activate' -e 'tell application "TextEdit" to get name of (make new document)')
+  sleep 0.6
+  before=$(lastid)
+  [ "$SOURCE" = file ] && cp "$wav" "$DATA/next.wav"
+  "$HELPER" key-down $KEY; sleep 0.4
+  if [ "$SOURCE" = file ]; then sleep "$(soxi -D "$wav")"; else e2e_play "$wav"; fi
+  sleep 0.15; "$HELPER" key-up $KEY
+  for _ in $(seq 300); do [ "$(lastid)" -gt "$before" ] && break; sleep 0.1; done
+  sleep 0.4
+  text=$("$HELPER" field-text com.apple.TextEdit 2>/dev/null)
+  row=$(sqlite3 -readonly -separator '|' "$SUSU_DB" "SELECT ifnull(latency_ms,''), status FROM dictation WHERE rowid > $before ORDER BY rowid LIMIT 1")
+  lat=${row%%|*}; status=${row##*|}
+  osascript -e "tell application \"TextEdit\" to close (every document whose name is \"$doc\" and path is missing value) saving no" >/dev/null
+  [ $FIRST = 1 ] || echo "," >> "$RUN.tmp"; FIRST=0
+  python3 -I -c 'import json,sys; t,l,s,i=sys.argv[1:]; print(json.dumps(i)+": "+json.dumps({"text":t,"sec":(int(l)/1000 if l else None),"status":s}, ensure_ascii=False), end="")' "$text" "$lat" "$status" "$id" >> "$RUN.tmp"
+  printf '%s %-12s %6s ms  %s\n' "$id" "$status" "${lat:-—}" "$text"
+done
+echo "}" >> "$RUN.tmp"; mv "$RUN.tmp" "$RUN"
+e2e_kill_app
+echo "run: $RUN"
+python3 -I tools/stt-eval/check.py "$RUN" --names 0.80 --wer-ru 0.13 $([ "$LIMIT" -lt 1000 ] && echo --partial)

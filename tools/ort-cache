@@ -1,0 +1,14 @@
+#!/bin/bash
+# download.onnxruntime.ai serves a wrong TLS certificate (since ~2026-11-20), so SwiftPM cannot fetch the
+# onnxruntime binaries. This puts byte-identical copies (branch deps-onnxruntime) into SwiftPM's artifact cache;
+# SwiftPM still checks them against the SHA-256 pinned in the package. Run once on a new machine and in CI.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+CACHE=~/Library/Caches/org.swift.swiftpm/artifacts
+mkdir -p "$CACHE"
+git fetch -q --depth 1 origin deps-onnxruntime
+for f in pod-archive-onnxruntime-c-1.24.2.zip pod-archive-onnxruntime-extensions-c-0.13.0.zip; do
+  key="https___download_onnxruntime_ai_$(echo "${f%.zip}" | tr '.-' '__')_zip"
+  [ -f "$CACHE/$key" ] || git show "FETCH_HEAD:$f" > "$CACHE/$key"
+done
+echo "onnxruntime archives in $CACHE"
